@@ -7,7 +7,7 @@
     {
       "binding": "DB",
       "database_name": "pz-discord-bot",
-      "database_id": "REPLACE_WITH_D1_DATABASE_ID"
+      "database_id": "8edc90c8-1fac-4d22-af2f-a733b0df0620"
     }
   ]
 }
