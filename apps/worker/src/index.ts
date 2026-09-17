@@ -1,5 +1,6 @@
 import nacl from 'tweetnacl';
 import type { ServerStatus } from '@pz-discord/shared';
+import { probeProjectZomboidRcon } from './rcon.js';
 
 interface Env {
   DB: D1Database;
@@ -8,12 +9,18 @@ interface Env {
   DISCORD_CHANNEL_ID: string;
   MONITOR_API_KEY: string;
   GITHUB_ACTIONS_TOKEN: string;
+  RCON_HOST: string;
+  RCON_PORT: string;
+  RCON_PASSWORD: string;
   JOIN_TEXT?: string;
 }
 
 interface DiscordInteraction {
+  id?: string;
+  application_id?: string;
+  token?: string;
   type: number;
-  data?: { custom_id?: string };
+  data?: { custom_id?: string; name?: string };
   member?: { user?: { id?: string } };
   user?: { id?: string };
 }
@@ -29,7 +36,7 @@ const GITHUB_API = 'https://api.github.com';
 const GITHUB_REPOSITORY = 'mojo23tms/pz-discord-bot';
 const GITHUB_WORKFLOW = 'poll-server.yml';
 const GITHUB_REF = 'main';
-const REFRESH_COOLDOWN_MS = 30_000;
+const REFRESH_COOLDOWN_MS = 10_000;
 const REFRESH_SETTING_KEY = 'refresh_last_requested_at';
 const EPHEMERAL = 1 << 6;
 
@@ -119,7 +126,7 @@ function statusMessage(status: ServerStatus): Record<string, unknown> {
   const names = status.playerNames.length > 0 ? status.playerNames.slice(0, 20).join('\n') : 'Nobody online';
   const fields: Record<string, unknown>[] = [
     { name: 'Players', value: players, inline: true },
-    { name: 'Ping', value: status.pingMs !== undefined ? `${status.pingMs} ms` : '—', inline: true },
+    { name: 'RCON', value: status.pingMs !== undefined ? `${status.pingMs} ms` : '—', inline: true },
     { name: 'Last checked', value: discordRelativeTime(status.checkedAt), inline: true },
     { name: 'Online', value: names, inline: false },
   ];
@@ -135,7 +142,7 @@ function statusMessage(status: ServerStatus): Record<string, unknown> {
       description: isOnline ? '🟢 Server is responding' : '🔴 Server is unavailable',
       color: isOnline ? 0x57f287 : 0xed4245,
       fields,
-      footer: { text: status.error ? `Last probe: ${status.error.slice(0, 120)}` : 'Project Zomboid status monitor' },
+      footer: { text: status.error ? `Probe error: ${status.error.slice(0, 120)}` : 'Project Zomboid status monitor • RCON' },
     }],
     components: [{
       type: 1,
@@ -200,6 +207,60 @@ async function notifyTransition(env: Env, before: ServerStatus | null, after: Se
   });
 }
 
+async function applyStatus(env: Env, status: ServerStatus): Promise<void> {
+  const before = await getLatestStatus(env);
+  await saveLatestStatus(env, status);
+  await syncStatusMessage(env, status);
+  await notifyTransition(env, before, status);
+}
+
+function rconPort(env: Env): number {
+  const port = Number.parseInt(env.RCON_PORT, 10);
+  if (!Number.isFinite(port) || port < 1 || port > 65_535) throw new Error('Invalid RCON_PORT');
+  return port;
+}
+
+async function probeRconStatus(env: Env): Promise<ServerStatus> {
+  const previous = await getLatestStatus(env);
+  const checkedAt = new Date().toISOString();
+  const port = rconPort(env);
+
+  try {
+    const probe = await probeProjectZomboidRcon(env.RCON_HOST, port, env.RCON_PASSWORD);
+    return {
+      health: 'online',
+      checkedAt,
+      name: probe.serverName ?? previous?.name ?? 'Boys Server',
+      host: env.RCON_HOST,
+      port,
+      players: probe.players,
+      maxPlayers: probe.maxPlayers ?? previous?.maxPlayers ?? 0,
+      playerNames: probe.playerNames,
+      pingMs: probe.latencyMs,
+      version: previous?.version && previous.version !== '1.0.0.0' ? previous.version : undefined,
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      health: 'offline',
+      checkedAt,
+      name: previous?.name ?? 'Boys Server',
+      host: env.RCON_HOST,
+      port,
+      players: 0,
+      maxPlayers: previous?.maxPlayers ?? 0,
+      playerNames: [],
+      error: message.slice(0, 200),
+    };
+  }
+}
+
+async function refreshViaRcon(env: Env): Promise<ServerStatus> {
+  const status = await probeRconStatus(env);
+  await applyStatus(env, status);
+  return status;
+}
+
 function normalizeJoinText(raw: string | undefined): string {
   if (!raw?.trim()) return 'Join instructions have not been configured yet.';
 
@@ -236,21 +297,7 @@ async function toggleSubscription(env: Env, userId: string): Promise<boolean> {
   return true;
 }
 
-async function triggerServerRefresh(env: Env): Promise<RefreshDispatchResult> {
-  const now = Date.now();
-  const rawLastRequestedAt = await getSetting(env, REFRESH_SETTING_KEY);
-  const lastRequestedAt = Number(rawLastRequestedAt ?? 0);
-
-  if (Number.isFinite(lastRequestedAt) && lastRequestedAt > 0) {
-    const elapsed = now - lastRequestedAt;
-    if (elapsed < REFRESH_COOLDOWN_MS) {
-      return {
-        triggered: false,
-        retryAfterSeconds: Math.max(1, Math.ceil((REFRESH_COOLDOWN_MS - elapsed) / 1000)),
-      };
-    }
-  }
-
+async function triggerGithubFallback(env: Env): Promise<RefreshDispatchResult> {
   const response = await fetch(
     `${GITHUB_API}/repos/${GITHUB_REPOSITORY}/actions/workflows/${GITHUB_WORKFLOW}/dispatches`,
     {
@@ -268,7 +315,25 @@ async function triggerServerRefresh(env: Env): Promise<RefreshDispatchResult> {
 
   if (!response.ok) {
     const body = await response.text();
-    throw new Error(`GitHub workflow dispatch failed: ${response.status} ${body.slice(0, 300)}`);
+    throw new Error(`GitHub fallback dispatch failed: ${response.status} ${body.slice(0, 300)}`);
+  }
+
+  return { triggered: true };
+}
+
+async function checkRefreshCooldown(env: Env): Promise<RefreshDispatchResult> {
+  const now = Date.now();
+  const rawLastRequestedAt = await getSetting(env, REFRESH_SETTING_KEY);
+  const lastRequestedAt = Number(rawLastRequestedAt ?? 0);
+
+  if (Number.isFinite(lastRequestedAt) && lastRequestedAt > 0) {
+    const elapsed = now - lastRequestedAt;
+    if (elapsed < REFRESH_COOLDOWN_MS) {
+      return {
+        triggered: false,
+        retryAfterSeconds: Math.max(1, Math.ceil((REFRESH_COOLDOWN_MS - elapsed) / 1000)),
+      };
+    }
   }
 
   await setSetting(env, REFRESH_SETTING_KEY, String(now));
@@ -330,7 +395,7 @@ function panelPayload(
   } else if (status) {
     fields = [
       { name: 'Players', value: playerCount, inline: true },
-      { name: 'Ping', value: status.pingMs !== undefined ? `${status.pingMs} ms` : '—', inline: true },
+      { name: 'RCON', value: status.pingMs !== undefined ? `${status.pingMs} ms` : '—', inline: true },
       { name: 'Notifications', value: subscribed ? '🔔 Enabled' : '🔕 Disabled', inline: true },
     ];
   }
@@ -339,7 +404,7 @@ function panelPayload(
 
   return {
     content: '',
-    embeds: [{ title, description, color, fields, timestamp: status?.checkedAt }],
+    embeds: [{ title, description, color, fields }],
     components: panelComponents(subscribed),
     allowed_mentions: { parse: [] },
   };
@@ -362,10 +427,21 @@ function interactionReply(content: string): Response {
 
 async function handleInteraction(env: Env, interaction: DiscordInteraction): Promise<Response> {
   if (interaction.type === 1) return json({ type: 1 });
+
+  const userId = getUserId(interaction);
+
+  if (interaction.type === 2) {
+    if (interaction.data?.name !== 'server') return interactionReply('Unknown command.');
+    const [status, subscribed] = await Promise.all([
+      getLatestStatus(env),
+      isSubscribed(env, userId),
+    ]);
+    return interactionCreate(panelPayload(env, status, subscribed, 'overview'));
+  }
+
   if (interaction.type !== 3) return interactionReply('Unsupported interaction.');
 
   const customId = interaction.data?.custom_id;
-  const userId = getUserId(interaction);
   const status = await getLatestStatus(env);
 
   // Backwards compatibility for the four-button status card that existed before the panel UI.
@@ -389,16 +465,31 @@ async function handleInteraction(env: Env, interaction: DiscordInteraction): Pro
     let subscribed = await isSubscribed(env, userId);
     let view: PanelView = 'overview';
     let notice: string | undefined;
+    let latestStatus = status;
 
     if (customId === 'pz:panel:refresh') {
-      try {
-        const result = await triggerServerRefresh(env);
-        notice = result.triggered
-          ? '🔄 **Fresh probe requested.** GitHub Actions is querying the server now. Give it roughly 10–30 seconds, then press Refresh again to see the new result.'
-          : `⏳ A refresh was already requested recently. Try again in about ${result.retryAfterSeconds}s.`;
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        notice = `⚠️ **Could not start a fresh probe.** ${message.slice(0, 180)}`;
+      const cooldown = await checkRefreshCooldown(env);
+      if (!cooldown.triggered) {
+        notice = `⏳ A refresh was already requested recently. Try again in about ${cooldown.retryAfterSeconds}s.`;
+      } else {
+        try {
+          latestStatus = await refreshViaRcon(env);
+          notice = latestStatus.health === 'online'
+            ? `✅ **Live RCON probe completed.** Fresh data received in ${latestStatus.pingMs ?? '?'} ms.`
+            : `⚠️ **RCON probe failed.** ${latestStatus.error ?? 'Server did not respond.'}`;
+
+          if (latestStatus.health === 'offline') {
+            try {
+              await triggerGithubFallback(env);
+              notice += '\nGitHub GameDig fallback was also started to double-check the game endpoint.';
+            } catch {
+              // RCON result is still useful; fallback failure is non-fatal.
+            }
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          notice = `⚠️ **Could not refresh the server.** ${message.slice(0, 180)}`;
+        }
       }
     } else if (customId === 'pz:panel:notify') {
       subscribed = await toggleSubscription(env, userId);
@@ -408,7 +499,6 @@ async function handleInteraction(env: Env, interaction: DiscordInteraction): Pro
       view = 'join';
     }
 
-    const latestStatus = customId === 'pz:panel:refresh' ? await getLatestStatus(env) : status;
     return interactionUpdate(panelPayload(env, latestStatus, subscribed, view, notice));
   }
 
@@ -421,10 +511,7 @@ async function handleIngest(request: Request, env: Env): Promise<Response> {
 
   try {
     const status = parseStatus(await request.json());
-    const before = await getLatestStatus(env);
-    await saveLatestStatus(env, status);
-    await syncStatusMessage(env, status);
-    await notifyTransition(env, before, status);
+    await applyStatus(env, status);
     return json({ ok: true });
   } catch (error) {
     return json({ ok: false, error: error instanceof Error ? error.message : String(error) }, { status: 400 });
@@ -436,7 +523,7 @@ export default {
     const url = new URL(request.url);
 
     if (request.method === 'GET' && url.pathname === '/health') {
-      return json({ ok: true, service: 'pz-discord-bot' });
+      return json({ ok: true, service: 'pz-discord-bot', monitor: 'rcon' });
     }
 
     if (request.method === 'POST' && url.pathname === '/ingest') {
@@ -452,5 +539,9 @@ export default {
     }
 
     return new Response('Not found', { status: 404 });
+  },
+
+  async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(refreshViaRcon(env));
   },
 };
