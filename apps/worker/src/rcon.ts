@@ -1,4 +1,4 @@
-import { connect, type Socket } from 'cloudflare:sockets';
+import { connect } from 'cloudflare:sockets';
 
 const SERVERDATA_RESPONSE_VALUE = 0;
 const SERVERDATA_AUTH_RESPONSE = 2;
@@ -34,7 +34,10 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): 
   });
 }
 
-function appendBytes(left: Uint8Array, right: Uint8Array): Uint8Array {
+function appendBytes(
+  left: Uint8Array<ArrayBufferLike>,
+  right: Uint8Array<ArrayBufferLike>,
+): Uint8Array<ArrayBufferLike> {
   const result = new Uint8Array(left.length + right.length);
   result.set(left, 0);
   result.set(right, left.length);
@@ -56,17 +59,20 @@ function encodePacket(id: number, type: number, body: string): Uint8Array {
 }
 
 class SourceRconClient {
-  private readonly socket: Socket;
+  private readonly socket: ReturnType<typeof connect>;
   private readonly reader: ReadableStreamDefaultReader<Uint8Array>;
   private readonly writer: WritableStreamDefaultWriter<Uint8Array>;
-  private buffer = new Uint8Array(0);
+  private buffer: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
 
   constructor(
     host: string,
     port: number,
     private readonly timeoutMs: number,
   ) {
-    this.socket = connect({ hostname: host, port }, { secureTransport: 'off' });
+    this.socket = connect(
+      { hostname: host, port },
+      { secureTransport: 'off', allowHalfOpen: false },
+    );
     this.reader = this.socket.readable.getReader();
     this.writer = this.socket.writable.getWriter();
   }
