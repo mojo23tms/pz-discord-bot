@@ -38,6 +38,9 @@ const GITHUB_WORKFLOW = 'poll-server.yml';
 const GITHUB_REF = 'main';
 const REFRESH_COOLDOWN_MS = 10_000;
 const REFRESH_SETTING_KEY = 'refresh_last_requested_at';
+const OFFLINE_FAILURE_THRESHOLD = 2;
+const OFFLINE_FAILURE_SETTING_KEY = 'offline_failure_count';
+const TRANSITION_MESSAGE_SETTING_KEY = 'transition_message_id';
 const EPHEMERAL = 1 << 6;
 
 function json(data: unknown, init: ResponseInit = {}): Response {
@@ -142,7 +145,7 @@ function statusMessage(status: ServerStatus): Record<string, unknown> {
       description: isOnline ? '🟢 Server is responding' : '🔴 Server is unavailable',
       color: isOnline ? 0x57f287 : 0xed4245,
       fields,
-      footer: { text: status.error ? `Probe error: ${status.error.slice(0, 120)}` : 'Project Zomboid status monitor • RCON' },
+      footer: { text: status.error ? `Probe note: ${status.error.slice(0, 120)}` : 'Project Zomboid status monitor • RCON' },
     }],
     components: [{
       type: 1,
@@ -193,25 +196,60 @@ async function notifyTransition(env: Env, before: ServerStatus | null, after: Se
   const users = await env.DB.prepare('SELECT discord_user_id FROM subscriptions').all<{ discord_user_id: string }>();
   if (!users.results.length) return;
 
+  const previousAlertId = await getSetting(env, TRANSITION_MESSAGE_SETTING_KEY);
+  if (previousAlertId) {
+    await discordRequest(env, `/channels/${env.DISCORD_CHANNEL_ID}/messages/${previousAlertId}`, {
+      method: 'DELETE',
+    });
+  }
+
   const mentions = users.results.map((row) => `<@${row.discord_user_id}>`).join(' ');
   const text = after.health === 'online'
     ? `🟢 **Boys Server is back online.** ${mentions}`
     : `🔴 **Boys Server appears offline.** ${mentions}`;
 
-  await discordRequest(env, `/channels/${env.DISCORD_CHANNEL_ID}/messages`, {
+  const created = await discordRequest(env, `/channels/${env.DISCORD_CHANNEL_ID}/messages`, {
     method: 'POST',
     body: JSON.stringify({
       content: text,
       allowed_mentions: { users: users.results.map((row) => row.discord_user_id) },
     }),
   });
+
+  if (created.ok) {
+    const body = await created.json() as { id: string };
+    await setSetting(env, TRANSITION_MESSAGE_SETTING_KEY, body.id);
+  }
 }
 
-async function applyStatus(env: Env, status: ServerStatus): Promise<void> {
+async function applyStatus(env: Env, status: ServerStatus): Promise<ServerStatus> {
   const before = await getLatestStatus(env);
-  await saveLatestStatus(env, status);
-  await syncStatusMessage(env, status);
-  await notifyTransition(env, before, status);
+  let effectiveStatus = status;
+
+  if (status.health === 'online') {
+    await setSetting(env, OFFLINE_FAILURE_SETTING_KEY, '0');
+  } else if (before?.health === 'online') {
+    const rawFailures = await getSetting(env, OFFLINE_FAILURE_SETTING_KEY);
+    const previousFailures = Number.parseInt(rawFailures ?? '0', 10);
+    const failures = (Number.isFinite(previousFailures) ? previousFailures : 0) + 1;
+    await setSetting(env, OFFLINE_FAILURE_SETTING_KEY, String(failures));
+
+    if (failures < OFFLINE_FAILURE_THRESHOLD) {
+      effectiveStatus = {
+        ...before,
+        checkedAt: status.checkedAt,
+        pingMs: undefined,
+        error: `Probe failed ${failures}/${OFFLINE_FAILURE_THRESHOLD}; waiting for confirmation. ${status.error ?? ''}`.trim().slice(0, 200),
+      };
+    }
+  } else if (status.health === 'offline') {
+    await setSetting(env, OFFLINE_FAILURE_SETTING_KEY, String(OFFLINE_FAILURE_THRESHOLD));
+  }
+
+  await saveLatestStatus(env, effectiveStatus);
+  await syncStatusMessage(env, effectiveStatus);
+  await notifyTransition(env, before, effectiveStatus);
+  return effectiveStatus;
 }
 
 function rconPort(env: Env): number {
@@ -257,8 +295,7 @@ async function probeRconStatus(env: Env): Promise<ServerStatus> {
 
 async function refreshViaRcon(env: Env): Promise<ServerStatus> {
   const status = await probeRconStatus(env);
-  await applyStatus(env, status);
-  return status;
+  return applyStatus(env, status);
 }
 
 function normalizeJoinText(raw: string | undefined): string {
@@ -474,9 +511,13 @@ async function handleInteraction(env: Env, interaction: DiscordInteraction): Pro
       } else {
         try {
           latestStatus = await refreshViaRcon(env);
-          notice = latestStatus.health === 'online'
-            ? `✅ **Live RCON probe completed.** Fresh data received in ${latestStatus.pingMs ?? '?'} ms.`
-            : `⚠️ **RCON probe failed.** ${latestStatus.error ?? 'Server did not respond.'}`;
+          if (latestStatus.health === 'online' && latestStatus.error?.startsWith('Probe failed')) {
+            notice = `⚠️ **RCON missed one probe.** Keeping the server online until a second consecutive failure confirms the outage.`;
+          } else {
+            notice = latestStatus.health === 'online'
+              ? `✅ **Live RCON probe completed.** Fresh data received in ${latestStatus.pingMs ?? '?'} ms.`
+              : `⚠️ **RCON probe failed twice.** ${latestStatus.error ?? 'Server did not respond.'}`;
+          }
 
           if (latestStatus.health === 'offline') {
             try {
