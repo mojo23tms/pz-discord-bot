@@ -1,0 +1,21 @@
+{
+  "name": "pz-discord-bot",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "monitor": "npm run start -w @pz-discord/monitor",
+    "dev:worker": "npm run dev -w @pz-discord/worker",
+    "deploy:worker": "npm run deploy -w @pz-discord/worker"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.2"
+  }
+}
