@@ -3,7 +3,8 @@ name: Poll Project Zomboid server
 on:
   workflow_dispatch:
   schedule:
-    - cron: '*/5 * * * *'
+    # Offset from the top of the hour to reduce GitHub cron congestion.
+    - cron: '2-59/5 * * * *'
 
 permissions:
   contents: read
