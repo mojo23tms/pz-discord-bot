@@ -1,0 +1,5 @@
+DISCORD_BOT_TOKEN=replace-me
+DISCORD_PUBLIC_KEY=replace-me
+DISCORD_CHANNEL_ID=replace-me
+MONITOR_API_KEY=replace-me
+JOIN_TEXT=Connect to the Project Zomboid server using the saved server entry in-game.
