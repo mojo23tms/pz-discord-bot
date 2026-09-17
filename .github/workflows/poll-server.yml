@@ -1,0 +1,39 @@
+name: Poll Project Zomboid server
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/5 * * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pz-server-poll
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Query server and publish status
+        env:
+          PZ_HOST: ${{ secrets.PZ_HOST }}
+          PZ_PORT: ${{ secrets.PZ_PORT }}
+          WORKER_INGEST_URL: ${{ secrets.WORKER_INGEST_URL }}
+          MONITOR_API_KEY: ${{ secrets.MONITOR_API_KEY }}
+          PZ_TIMEOUT_MS: '7000'
+        run: npm run monitor
