@@ -17,6 +17,8 @@ interface DiscordInteraction {
   user?: { id?: string };
 }
 
+type PanelView = 'overview' | 'players' | 'join';
+
 const DISCORD_API = 'https://discord.com/api/v10';
 const EPHEMERAL = 1 << 6;
 
@@ -98,7 +100,7 @@ function statusMessage(status: ServerStatus): Record<string, unknown> {
   const isOnline = status.health === 'online';
   const players = status.maxPlayers > 0 ? `${status.players} / ${status.maxPlayers}` : String(status.players);
   const names = status.playerNames.length > 0 ? status.playerNames.slice(0, 20).join('\n') : 'Nobody online';
-  const checkedUnix = Math.floor(new Date(status.checkedAt).getTime() / 1000);
+  const build = status.version && status.version !== '1.0.0.0' ? status.version : 'Not exposed by query';
 
   return {
     content: '',
@@ -109,7 +111,7 @@ function statusMessage(status: ServerStatus): Record<string, unknown> {
       fields: [
         { name: 'Players', value: players, inline: true },
         { name: 'Ping', value: status.pingMs !== undefined ? `${status.pingMs} ms` : '—', inline: true },
-        { name: 'Build', value: status.version ?? '—', inline: true },
+        { name: 'Build', value: build, inline: true },
         { name: 'Online', value: names, inline: false },
       ],
       footer: { text: status.error ? `Last probe: ${status.error.slice(0, 120)}` : 'Project Zomboid status monitor' },
@@ -118,19 +120,15 @@ function statusMessage(status: ServerStatus): Record<string, unknown> {
     components: [{
       type: 1,
       components: [
-        { type: 2, style: 1, label: 'Refresh', custom_id: 'pz:refresh', emoji: { name: '🔄' } },
-        { type: 2, style: 2, label: 'Players', custom_id: 'pz:players', emoji: { name: '👥' } },
-        { type: 2, style: 2, label: 'How to join', custom_id: 'pz:join', emoji: { name: '🎮' } },
-        { type: 2, style: 3, label: 'Notify me', custom_id: 'pz:notify', emoji: { name: '🔔' } },
+        { type: 2, style: 1, label: 'Server controls', custom_id: 'pz:panel', emoji: { name: '🎛️' } },
       ],
     }],
     allowed_mentions: { parse: [] },
-    _checkedUnix: checkedUnix,
   };
 }
 
 async function discordRequest(env: Env, path: string, init: RequestInit): Promise<Response> {
-  const response = await fetch(`${DISCORD_API}${path}`, {
+  return fetch(`${DISCORD_API}${path}`, {
     ...init,
     headers: {
       authorization: `Bot ${env.DISCORD_BOT_TOKEN}`,
@@ -138,14 +136,12 @@ async function discordRequest(env: Env, path: string, init: RequestInit): Promis
       ...(init.headers ?? {}),
     },
   });
-  return response;
 }
 
 async function syncStatusMessage(env: Env, status: ServerStatus): Promise<void> {
   const payload = statusMessage(status);
-  delete payload._checkedUnix;
-
   const existingId = await getSetting(env, 'status_message_id');
+
   if (existingId) {
     const edited = await discordRequest(env, `/channels/${env.DISCORD_CHANNEL_ID}/messages/${existingId}`, {
       method: 'PATCH',
@@ -184,11 +180,117 @@ async function notifyTransition(env: Env, before: ServerStatus | null, after: Se
   });
 }
 
-function interactionReply(content: string): Response {
+function normalizeJoinText(raw: string | undefined): string {
+  if (!raw?.trim()) return 'Join instructions have not been configured yet.';
+
+  let text = raw.trim().replace(/\\n/g, '\n');
+  let firstLabel = true;
+  text = text.replace(/\s*(IP|Port|Server|Password):\s*/gi, (_match, label: string) => {
+    const prefix = firstLabel ? '' : '\n';
+    firstLabel = false;
+    return `${prefix}**${label}:** `;
+  });
+  return text;
+}
+
+function getUserId(interaction: DiscordInteraction): string | null {
+  return interaction.member?.user?.id ?? interaction.user?.id ?? null;
+}
+
+async function isSubscribed(env: Env, userId: string | null): Promise<boolean> {
+  if (!userId) return false;
+  const row = await env.DB.prepare('SELECT discord_user_id FROM subscriptions WHERE discord_user_id = ?')
+    .bind(userId).first<{ discord_user_id: string }>();
+  return Boolean(row);
+}
+
+async function toggleSubscription(env: Env, userId: string): Promise<boolean> {
+  const subscribed = await isSubscribed(env, userId);
+  if (subscribed) {
+    await env.DB.prepare('DELETE FROM subscriptions WHERE discord_user_id = ?').bind(userId).run();
+    return false;
+  }
+
+  await env.DB.prepare('INSERT INTO subscriptions (discord_user_id, created_at) VALUES (?, ?)')
+    .bind(userId, Date.now()).run();
+  return true;
+}
+
+function panelComponents(subscribed: boolean): Record<string, unknown>[] {
+  return [{
+    type: 1,
+    components: [
+      { type: 2, style: 1, label: 'Refresh', custom_id: 'pz:panel:refresh', emoji: { name: '🔄' } },
+      { type: 2, style: 2, label: 'Players', custom_id: 'pz:panel:players', emoji: { name: '👥' } },
+      { type: 2, style: 2, label: 'How to join', custom_id: 'pz:panel:join', emoji: { name: '🎮' } },
+      {
+        type: 2,
+        style: subscribed ? 4 : 3,
+        label: subscribed ? 'Notifications on' : 'Notify me',
+        custom_id: 'pz:panel:notify',
+        emoji: { name: subscribed ? '🔕' : '🔔' },
+      },
+    ],
+  }];
+}
+
+function panelPayload(env: Env, status: ServerStatus | null, subscribed: boolean, view: PanelView): Record<string, unknown> {
+  const isOnline = status?.health === 'online';
+  const color = isOnline ? 0x57f287 : 0xed4245;
+  const age = status ? Math.max(0, Math.floor((Date.now() - new Date(status.checkedAt).getTime()) / 1000)) : null;
+  const playerCount = status ? `${status.players}/${status.maxPlayers || '?'}` : '—';
+  const playerNames = status?.playerNames.length ? status.playerNames.map((name) => `• ${name}`).join('\n') : 'Nobody online';
+
+  let title = 'BOYS SERVER • Controls';
+  let description = status
+    ? `${isOnline ? '🟢' : '🔴'} **${status.health.toUpperCase()}** • ${playerCount} players • checked ${age}s ago`
+    : '⚪ No server probe has completed yet.';
+  let fields: Record<string, unknown>[] = [
+    { name: 'Notifications', value: subscribed ? '🔔 Enabled' : '🔕 Disabled', inline: true },
+  ];
+
+  if (view === 'players') {
+    title = 'BOYS SERVER • Players';
+    description = !status || !isOnline
+      ? '🔴 Server is currently unavailable.'
+      : `**Online (${status.players})**\n${playerNames}`;
+    fields = [{ name: 'Notifications', value: subscribed ? '🔔 Enabled' : '🔕 Disabled', inline: true }];
+  } else if (view === 'join') {
+    title = 'BOYS SERVER • How to join';
+    description = normalizeJoinText(env.JOIN_TEXT);
+    fields = [
+      { name: 'Current status', value: status ? `${isOnline ? '🟢 Online' : '🔴 Offline'} • ${playerCount}` : 'Unknown', inline: true },
+      { name: 'Notifications', value: subscribed ? '🔔 Enabled' : '🔕 Disabled', inline: true },
+    ];
+  } else if (status) {
+    fields = [
+      { name: 'Players', value: playerCount, inline: true },
+      { name: 'Ping', value: status.pingMs !== undefined ? `${status.pingMs} ms` : '—', inline: true },
+      { name: 'Notifications', value: subscribed ? '🔔 Enabled' : '🔕 Disabled', inline: true },
+    ];
+  }
+
+  return {
+    content: '',
+    embeds: [{ title, description, color, fields, timestamp: status?.checkedAt }],
+    components: panelComponents(subscribed),
+    allowed_mentions: { parse: [] },
+  };
+}
+
+function interactionCreate(payload: Record<string, unknown>): Response {
   return json({
     type: 4,
-    data: { content, flags: EPHEMERAL, allowed_mentions: { parse: [] } },
+    data: { ...payload, flags: EPHEMERAL },
   });
+}
+
+function interactionUpdate(payload: Record<string, unknown>): Response {
+  return json({ type: 7, data: payload });
+}
+
+function interactionReply(content: string): Response {
+  return interactionCreate({ content, allowed_mentions: { parse: [] } });
 }
 
 async function handleInteraction(env: Env, interaction: DiscordInteraction): Promise<Response> {
@@ -196,39 +298,39 @@ async function handleInteraction(env: Env, interaction: DiscordInteraction): Pro
   if (interaction.type !== 3) return interactionReply('Unsupported interaction.');
 
   const customId = interaction.data?.custom_id;
+  const userId = getUserId(interaction);
   const status = await getLatestStatus(env);
 
-  if (customId === 'pz:refresh') {
-    if (!status) return interactionReply('No server probe has completed yet.');
-    const age = Math.max(0, Math.floor((Date.now() - new Date(status.checkedAt).getTime()) / 1000));
-    return interactionReply(`Latest probe: **${status.health.toUpperCase()}**, ${status.players}/${status.maxPlayers || '?'} players, checked ${age}s ago. The automatic probe runs every 5 minutes.`);
+  // Backwards compatibility for the four-button status card that existed before the panel UI.
+  if (customId === 'pz:refresh' || customId === 'pz:players' || customId === 'pz:join' || customId === 'pz:notify') {
+    if (customId === 'pz:notify' && !userId) return interactionReply('Could not determine your Discord user ID.');
+    const subscribed = customId === 'pz:notify' && userId
+      ? await toggleSubscription(env, userId)
+      : await isSubscribed(env, userId);
+    const view: PanelView = customId === 'pz:players' ? 'players' : customId === 'pz:join' ? 'join' : 'overview';
+    return interactionCreate(panelPayload(env, status, subscribed, view));
   }
 
-  if (customId === 'pz:players') {
-    if (!status || status.health === 'offline') return interactionReply('Server is currently unavailable.');
-    if (!status.playerNames.length) return interactionReply(`Server is online with ${status.players} player(s), but the query did not expose player names.`);
-    return interactionReply(`**Online (${status.players})**\n${status.playerNames.map((name) => `• ${name}`).join('\n')}`);
+  if (customId === 'pz:panel') {
+    const subscribed = await isSubscribed(env, userId);
+    return interactionCreate(panelPayload(env, status, subscribed, 'overview'));
   }
 
-  if (customId === 'pz:join') {
-    return interactionReply(env.JOIN_TEXT?.trim() || 'Join instructions have not been configured yet.');
-  }
-
-  if (customId === 'pz:notify') {
-    const userId = interaction.member?.user?.id ?? interaction.user?.id;
+  if (customId?.startsWith('pz:panel:')) {
     if (!userId) return interactionReply('Could not determine your Discord user ID.');
 
-    const current = await env.DB.prepare('SELECT discord_user_id FROM subscriptions WHERE discord_user_id = ?')
-      .bind(userId).first<{ discord_user_id: string }>();
+    let subscribed = await isSubscribed(env, userId);
+    let view: PanelView = 'overview';
 
-    if (current) {
-      await env.DB.prepare('DELETE FROM subscriptions WHERE discord_user_id = ?').bind(userId).run();
-      return interactionReply('🔕 Server status notifications disabled for you.');
+    if (customId === 'pz:panel:notify') {
+      subscribed = await toggleSubscription(env, userId);
+    } else if (customId === 'pz:panel:players') {
+      view = 'players';
+    } else if (customId === 'pz:panel:join') {
+      view = 'join';
     }
 
-    await env.DB.prepare('INSERT INTO subscriptions (discord_user_id, created_at) VALUES (?, ?)')
-      .bind(userId, Date.now()).run();
-    return interactionReply('🔔 You will be mentioned when the server changes between online and offline.');
+    return interactionUpdate(panelPayload(env, status, subscribed, view));
   }
 
   return interactionReply('Unknown button.');
