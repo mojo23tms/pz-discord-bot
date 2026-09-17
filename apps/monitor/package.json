@@ -1,0 +1,17 @@
+{
+  "name": "@pz-discord/monitor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@pz-discord/shared": "*",
+    "gamedig": "^5.3.2"
+  },
+  "devDependencies": {
+    "tsx": "^4.20.5"
+  }
+}
