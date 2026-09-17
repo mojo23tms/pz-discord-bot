@@ -107,11 +107,26 @@ async function setSetting(env: Env, key: string, value: string): Promise<void> {
   ).bind(key, value).run();
 }
 
+function discordRelativeTime(iso: string): string {
+  const ms = new Date(iso).getTime();
+  if (!Number.isFinite(ms)) return 'Unknown';
+  return `<t:${Math.floor(ms / 1000)}:R>`;
+}
+
 function statusMessage(status: ServerStatus): Record<string, unknown> {
   const isOnline = status.health === 'online';
   const players = status.maxPlayers > 0 ? `${status.players} / ${status.maxPlayers}` : String(status.players);
   const names = status.playerNames.length > 0 ? status.playerNames.slice(0, 20).join('\n') : 'Nobody online';
-  const build = status.version && status.version !== '1.0.0.0' ? status.version : 'Not exposed by query';
+  const fields: Record<string, unknown>[] = [
+    { name: 'Players', value: players, inline: true },
+    { name: 'Ping', value: status.pingMs !== undefined ? `${status.pingMs} ms` : '—', inline: true },
+    { name: 'Last checked', value: discordRelativeTime(status.checkedAt), inline: true },
+    { name: 'Online', value: names, inline: false },
+  ];
+
+  if (status.version && status.version !== '1.0.0.0') {
+    fields.splice(2, 0, { name: 'Build', value: status.version, inline: true });
+  }
 
   return {
     content: '',
@@ -119,14 +134,8 @@ function statusMessage(status: ServerStatus): Record<string, unknown> {
       title: 'BOYS SERVER',
       description: isOnline ? '🟢 Server is responding' : '🔴 Server is unavailable',
       color: isOnline ? 0x57f287 : 0xed4245,
-      fields: [
-        { name: 'Players', value: players, inline: true },
-        { name: 'Ping', value: status.pingMs !== undefined ? `${status.pingMs} ms` : '—', inline: true },
-        { name: 'Build', value: build, inline: true },
-        { name: 'Online', value: names, inline: false },
-      ],
+      fields,
       footer: { text: status.error ? `Last probe: ${status.error.slice(0, 120)}` : 'Project Zomboid status monitor' },
-      timestamp: status.checkedAt,
     }],
     components: [{
       type: 1,
