@@ -7,6 +7,7 @@ interface Env {
   DISCORD_PUBLIC_KEY: string;
   DISCORD_CHANNEL_ID: string;
   MONITOR_API_KEY: string;
+  GITHUB_ACTIONS_TOKEN: string;
   JOIN_TEXT?: string;
 }
 
@@ -19,7 +20,17 @@ interface DiscordInteraction {
 
 type PanelView = 'overview' | 'players' | 'join';
 
+type RefreshDispatchResult =
+  | { triggered: true }
+  | { triggered: false; retryAfterSeconds: number };
+
 const DISCORD_API = 'https://discord.com/api/v10';
+const GITHUB_API = 'https://api.github.com';
+const GITHUB_REPOSITORY = 'mojo23tms/pz-discord-bot';
+const GITHUB_WORKFLOW = 'poll-server.yml';
+const GITHUB_REF = 'main';
+const REFRESH_COOLDOWN_MS = 30_000;
+const REFRESH_SETTING_KEY = 'refresh_last_requested_at';
 const EPHEMERAL = 1 << 6;
 
 function json(data: unknown, init: ResponseInit = {}): Response {
@@ -216,6 +227,45 @@ async function toggleSubscription(env: Env, userId: string): Promise<boolean> {
   return true;
 }
 
+async function triggerServerRefresh(env: Env): Promise<RefreshDispatchResult> {
+  const now = Date.now();
+  const rawLastRequestedAt = await getSetting(env, REFRESH_SETTING_KEY);
+  const lastRequestedAt = Number(rawLastRequestedAt ?? 0);
+
+  if (Number.isFinite(lastRequestedAt) && lastRequestedAt > 0) {
+    const elapsed = now - lastRequestedAt;
+    if (elapsed < REFRESH_COOLDOWN_MS) {
+      return {
+        triggered: false,
+        retryAfterSeconds: Math.max(1, Math.ceil((REFRESH_COOLDOWN_MS - elapsed) / 1000)),
+      };
+    }
+  }
+
+  const response = await fetch(
+    `${GITHUB_API}/repos/${GITHUB_REPOSITORY}/actions/workflows/${GITHUB_WORKFLOW}/dispatches`,
+    {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${env.GITHUB_ACTIONS_TOKEN}`,
+        accept: 'application/vnd.github+json',
+        'x-github-api-version': '2022-11-28',
+        'user-agent': 'pz-discord-bot-worker',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ ref: GITHUB_REF }),
+    },
+  );
+
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`GitHub workflow dispatch failed: ${response.status} ${body.slice(0, 300)}`);
+  }
+
+  await setSetting(env, REFRESH_SETTING_KEY, String(now));
+  return { triggered: true };
+}
+
 function panelComponents(subscribed: boolean): Record<string, unknown>[] {
   return [{
     type: 1,
@@ -234,7 +284,13 @@ function panelComponents(subscribed: boolean): Record<string, unknown>[] {
   }];
 }
 
-function panelPayload(env: Env, status: ServerStatus | null, subscribed: boolean, view: PanelView): Record<string, unknown> {
+function panelPayload(
+  env: Env,
+  status: ServerStatus | null,
+  subscribed: boolean,
+  view: PanelView,
+  notice?: string,
+): Record<string, unknown> {
   const isOnline = status?.health === 'online';
   const color = isOnline ? 0x57f287 : 0xed4245;
   const age = status ? Math.max(0, Math.floor((Date.now() - new Date(status.checkedAt).getTime()) / 1000)) : null;
@@ -269,6 +325,8 @@ function panelPayload(env: Env, status: ServerStatus | null, subscribed: boolean
       { name: 'Notifications', value: subscribed ? '🔔 Enabled' : '🔕 Disabled', inline: true },
     ];
   }
+
+  if (notice) description += `\n\n${notice}`;
 
   return {
     content: '',
@@ -321,8 +379,19 @@ async function handleInteraction(env: Env, interaction: DiscordInteraction): Pro
 
     let subscribed = await isSubscribed(env, userId);
     let view: PanelView = 'overview';
+    let notice: string | undefined;
 
-    if (customId === 'pz:panel:notify') {
+    if (customId === 'pz:panel:refresh') {
+      try {
+        const result = await triggerServerRefresh(env);
+        notice = result.triggered
+          ? '🔄 **Fresh probe requested.** GitHub Actions is querying the server now. Give it roughly 10–30 seconds, then press Refresh again to see the new result.'
+          : `⏳ A refresh was already requested recently. Try again in about ${result.retryAfterSeconds}s.`;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        notice = `⚠️ **Could not start a fresh probe.** ${message.slice(0, 180)}`;
+      }
+    } else if (customId === 'pz:panel:notify') {
       subscribed = await toggleSubscription(env, userId);
     } else if (customId === 'pz:panel:players') {
       view = 'players';
@@ -330,7 +399,8 @@ async function handleInteraction(env: Env, interaction: DiscordInteraction): Pro
       view = 'join';
     }
 
-    return interactionUpdate(panelPayload(env, status, subscribed, view));
+    const latestStatus = customId === 'pz:panel:refresh' ? await getLatestStatus(env) : status;
+    return interactionUpdate(panelPayload(env, latestStatus, subscribed, view, notice));
   }
 
   return interactionReply('Unknown button.');
