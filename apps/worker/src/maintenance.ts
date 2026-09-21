@@ -10,6 +10,8 @@ export interface MaintenanceEnv {
   RCON_PASSWORD: string;
   RESTART_ANCHOR_UTC?: string;
   RESTART_INTERVAL_HOURS?: string;
+  RESTART_DOWNTIME_MINUTES?: string;
+  RESTART_RECOVERY_GRACE_MINUTES?: string;
   WORKSHOP_IDS?: string;
   WORKSHOP_POLL_MINUTES?: string;
 }
@@ -62,9 +64,9 @@ const STEAM_DETAILS_API = 'https://api.steampowered.com/ISteamRemoteStorage/GetP
 const MOD_POLL_SETTING_KEY = 'workshop_last_polled_at';
 const MOD_ALERT_SETTING_KEY = 'workshop_update_alert_message_id';
 const DEFAULT_RESTART_INTERVAL_HOURS = 6;
+const DEFAULT_RESTART_DOWNTIME_MINUTES = 10;
+const DEFAULT_RESTART_RECOVERY_GRACE_MINUTES = 5;
 const DEFAULT_WORKSHOP_POLL_MINUTES = 15;
-const RESTART_FAILURE_GRACE_MS = 5 * 60_000;
-const RESTART_OBSERVATION_WINDOW_MS = 10 * 60_000;
 
 function parsePositiveNumber(raw: string | undefined, fallback: number): number {
   const parsed = Number(raw);
@@ -103,12 +105,23 @@ function previousRestartAtMs(env: MaintenanceEnv, now = Date.now()): number | un
   return schedule.anchorMs + intervalsElapsed * schedule.intervalMs;
 }
 
+function restartDowntimeMs(env: MaintenanceEnv): number {
+  return parsePositiveNumber(env.RESTART_DOWNTIME_MINUTES, DEFAULT_RESTART_DOWNTIME_MINUTES) * 60_000;
+}
+
+function restartRecoveryGraceMs(env: MaintenanceEnv): number {
+  return parsePositiveNumber(env.RESTART_RECOVERY_GRACE_MINUTES, DEFAULT_RESTART_RECOVERY_GRACE_MINUTES) * 60_000;
+}
+
 export function isPlannedMaintenanceWindow(env: MaintenanceEnv, now = Date.now()): boolean {
   const next = nextRestartAtMs(env, now);
   if (next !== undefined && next - now >= 0 && next - now <= 2 * 60_000) return true;
 
   const previous = previousRestartAtMs(env, now);
-  return previous !== undefined && now - previous >= 0 && now - previous <= RESTART_FAILURE_GRACE_MS;
+  if (previous === undefined) return false;
+
+  const expectedStartAt = previous + restartDowntimeMs(env);
+  return now - previous >= 0 && now <= expectedStartAt + restartRecoveryGraceMs(env);
 }
 
 async function getSetting(env: MaintenanceEnv, key: string): Promise<string | null> {
@@ -196,12 +209,12 @@ function warningText(milestoneMinutes: number, remainingMs: number): string {
   const closeToMilestone = Math.abs(actualMinutes - milestoneMinutes) <= 2;
   const minutes = closeToMilestone ? milestoneMinutes : actualMinutes;
 
-  if (minutes === 60) return 'SERVER: Planned restart in 1 hour.';
-  if (minutes === 1) return 'SERVER: Planned restart in 1 minute. Saving world now.';
+  if (minutes === 60) return 'SERVER: Planned maintenance in 1 hour.';
+  if (minutes === 1) return 'SERVER: Planned maintenance in 1 minute. Saving world now.';
   if (minutes <= 5) {
-    return `SERVER: Planned restart in about ${minutes} minute${minutes === 1 ? '' : 's'}. Find a safe place and finish what you are doing.`;
+    return `SERVER: Planned maintenance in about ${minutes} minute${minutes === 1 ? '' : 's'}. Find a safe place and finish what you are doing.`;
   }
-  return `SERVER: Planned restart in about ${minutes} minutes.`;
+  return `SERVER: Planned maintenance in about ${minutes} minutes.`;
 }
 
 async function markCycleColumn(
@@ -448,7 +461,12 @@ async function processRestartObservation(
   now: number,
   restartAt: number,
 ): Promise<void> {
-  if (now < restartAt || now - restartAt > RESTART_OBSERVATION_WINDOW_MS) return;
+  const downtimeMs = restartDowntimeMs(env);
+  const recoveryGraceMs = restartRecoveryGraceMs(env);
+  const expectedStartAt = restartAt + downtimeMs;
+  const observationEnd = expectedStartAt + recoveryGraceMs + 5 * 60_000;
+
+  if (now < restartAt || now > observationEnd) return;
 
   await ensureRestartCycle(env, restartAt);
   const cycle = await getRestartCycle(env, restartAt);
@@ -459,10 +477,11 @@ async function processRestartObservation(
       await markCycleColumn(env, restartAt, 'outage_seen_at', now);
     }
 
-    if (now - restartAt >= RESTART_FAILURE_GRACE_MS && cycle.failure_alert_at === null) {
+    if (now >= expectedStartAt + recoveryGraceMs && cycle.failure_alert_at === null) {
+      const graceMinutes = Math.round(recoveryGraceMs / 60_000);
       const messageId = await postDiscordMessage(
         env,
-        `🔴 **Planned restart has not recovered normally.**\nThe server is still unreachable more than 5 minutes after the scheduled restart (<t:${Math.floor(restartAt / 1000)}:t>). HostHavoc may need manual attention.`,
+        `🔴 **Planned maintenance has not recovered normally.**\nThe server is still unreachable more than ${graceMinutes} minutes after its scheduled start (<t:${Math.floor(expectedStartAt / 1000)}:t>). HostHavoc may need manual attention.`,
       );
 
       await env.DB.prepare(
@@ -475,7 +494,7 @@ async function processRestartObservation(
     return;
   }
 
-  if (cycle.outage_seen_at !== null && cycle.recovered_at === null) {
+  if (cycle.outage_seen_at !== null && cycle.recovered_at === null && now >= restartAt) {
     await markCycleColumn(env, restartAt, 'recovered_at', now);
     await clearHandledWorkshopUpdates(env, restartAt);
 
