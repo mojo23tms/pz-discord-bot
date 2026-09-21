@@ -216,3 +216,28 @@ export async function probeProjectZomboidRcon(
     client.close();
   }
 }
+
+export async function executeProjectZomboidRconCommands(
+  host: string,
+  port: number,
+  password: string,
+  commands: string[],
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+): Promise<string[]> {
+  if (commands.length === 0) return [];
+
+  const client = new SourceRconClient(host, port, timeoutMs);
+
+  try {
+    await client.open();
+    await client.authenticate(password);
+
+    const responses: string[] = [];
+    for (const command of commands) {
+      responses.push(await client.command(command));
+    }
+    return responses;
+  } finally {
+    client.close();
+  }
+}
