@@ -2,4 +2,17 @@ DISCORD_BOT_TOKEN=replace-me
 DISCORD_PUBLIC_KEY=replace-me
 DISCORD_CHANNEL_ID=replace-me
 MONITOR_API_KEY=replace-me
+GITHUB_ACTIONS_TOKEN=replace-me
+RCON_HOST=replace-me
+RCON_PORT=27020
+RCON_PASSWORD=replace-me
 JOIN_TEXT=Connect to the Project Zomboid server using the saved server entry in-game.
+
+# Planned maintenance. Set RESTART_ANCHOR_UTC to one real HostHavoc restart time.
+# Example only: 2026-09-22T00:00:00Z
+RESTART_ANCHOR_UTC=
+RESTART_INTERVAL_HOURS=6
+
+# Semicolon/comma/space-separated Project Zomboid Workshop IDs.
+WORKSHOP_IDS=
+WORKSHOP_POLL_MINUTES=15
