@@ -83,8 +83,12 @@ Configure these Worker secrets/variables:
 - `RCON_PORT` - Project Zomboid RCON TCP port.
 - `RCON_PASSWORD` - strong dedicated RCON password. Never reuse the Discord bot token, join password or an account password.
 - `JOIN_TEXT` - optional join instructions shown by the button.
-- `RESTART_ANCHOR_UTC` - one real HostHavoc restart timestamp in ISO-8601 UTC form, for example `2026-09-22T00:00:00Z`.
-- `RESTART_INTERVAL_HOURS` - restart cadence; defaults to `6`.
+- `RESTART_TIMEZONE` - IANA time zone used by the HostHavoc panel, for example `Europe/Kyiv`.
+- `RESTART_START_LOCAL` - the panel's local STOP time in `HH:MM` form, for example `18:00`.
+- `RESTART_ANCHOR_UTC` - legacy/fallback fixed-UTC anchor; leave empty when the timezone-aware fields are configured.
+- `RESTART_INTERVAL_HOURS` - maintenance cadence; defaults to `6`.
+- `RESTART_DOWNTIME_MINUTES` - planned gap from STOP to START; defaults to `10`.
+- `RESTART_RECOVERY_GRACE_MINUTES` - additional grace after START before raising a recovery alert; defaults to `5`.
 - `WORKSHOP_IDS` - semicolon/comma/space-separated Workshop IDs from the active PZ `WorkshopItems=` list.
 - `WORKSHOP_POLL_MINUTES` - Steam metadata polling interval; defaults to `15`.
 
