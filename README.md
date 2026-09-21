@@ -36,6 +36,10 @@ GitHub Actions + GameDig
 - Ten-second global Refresh cooldown.
 - Current players, join instructions and notification subscription controls.
 - D1 storage for latest status, status-message ID, refresh cooldown and subscriptions.
+- Planned 6-hour maintenance coordination with in-game RCON notices at 1h, 30m, 5m and 1m.
+- Automatic `save` command in the final minute before a planned restart.
+- Planned-restart outage suppression plus a Discord alert if the server is still down after 5 minutes.
+- Steam Workshop update monitoring with one batched pending-update alert and status-card indicator.
 - GitHub GameDig workflow retained as a manual fallback and as a double-check when an on-demand RCON probe fails.
 - `/server` interaction handling is implemented in the Worker; the Discord slash command still needs to be registered with the application before it appears in the client.
 - No recurring hosting cost when kept within Cloudflare/GitHub free allowances.
@@ -60,7 +64,13 @@ packages/
 
 Create a Worker and a D1 database, then update `apps/worker/wrangler.jsonc` with the real D1 database id.
 
-Run the SQL in `apps/worker/schema.sql` against the D1 database.
+Run the SQL in `apps/worker/schema.sql` against the D1 database. It is idempotent and now creates the maintenance-cycle and Workshop-state tables as well.
+
+For an existing deployment:
+
+```bash
+npx wrangler d1 execute pz-discord-bot --remote --file=apps/worker/schema.sql
+```
 
 Configure these Worker secrets/variables:
 
@@ -73,6 +83,12 @@ Configure these Worker secrets/variables:
 - `RCON_PORT` - Project Zomboid RCON TCP port.
 - `RCON_PASSWORD` - strong dedicated RCON password. Never reuse the Discord bot token, join password or an account password.
 - `JOIN_TEXT` - optional join instructions shown by the button.
+- `RESTART_ANCHOR_UTC` - one real HostHavoc restart timestamp in ISO-8601 UTC form, for example `2026-09-22T00:00:00Z`.
+- `RESTART_INTERVAL_HOURS` - restart cadence; defaults to `6`.
+- `WORKSHOP_IDS` - semicolon/comma/space-separated Workshop IDs from the active PZ `WorkshopItems=` list.
+- `WORKSHOP_POLL_MINUTES` - Steam metadata polling interval; defaults to `15`.
+
+The Worker does **not** restart HostHavoc itself. HostHavoc remains the lifecycle authority. The Worker coordinates player notices, saves, restart observation and mod-update visibility around the provider's scheduled restart.
 
 `wrangler.jsonc` configures a `* * * * *` Cron Trigger, so the Worker runs the RCON health probe once per minute after deployment.
 
@@ -144,7 +160,8 @@ The `showoptions` response is parsed in memory only for `MaxPlayers` and `Public
 - Register the `/server` slash command as a permanent recovery/control entry point.
 - Require two consecutive failed probes before sending an offline notification, to reduce false alarms.
 - Notifications when the server reaches N players.
-- Scheduled restart notices.
+- Host-provider restart API integration, if HostHavoc exposes a supported endpoint.
+- PZ `checkModsNeedUpdate` log ingestion as a second, authoritative mod-update signal.
 - Modpack/build version shown in Discord.
 - Health history and uptime metrics.
 - Carefully scoped admin-only RCON actions with role checks and confirmation prompts.

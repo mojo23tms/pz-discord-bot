@@ -1,17 +1,17 @@
 import nacl from 'tweetnacl';
 import type { ServerStatus } from '@pz-discord/shared';
 import { probeProjectZomboidRcon } from './rcon.js';
+import {
+  getMaintenanceSnapshot,
+  isPlannedMaintenanceWindow,
+  runMaintenanceTick,
+  type MaintenanceEnv,
+} from './maintenance.js';
 
-interface Env {
-  DB: D1Database;
-  DISCORD_BOT_TOKEN: string;
+interface Env extends MaintenanceEnv {
   DISCORD_PUBLIC_KEY: string;
-  DISCORD_CHANNEL_ID: string;
   MONITOR_API_KEY: string;
   GITHUB_ACTIONS_TOKEN: string;
-  RCON_HOST: string;
-  RCON_PORT: string;
-  RCON_PASSWORD: string;
   JOIN_TEXT?: string;
 }
 
@@ -123,14 +123,25 @@ function discordRelativeTime(iso: string): string {
   return `<t:${Math.floor(ms / 1000)}:R>`;
 }
 
-function statusMessage(status: ServerStatus): Record<string, unknown> {
+async function statusMessage(env: Env, status: ServerStatus): Promise<Record<string, unknown>> {
   const isOnline = status.health === 'online';
   const players = status.maxPlayers > 0 ? `${status.players} / ${status.maxPlayers}` : String(status.players);
   const names = status.playerNames.length > 0 ? status.playerNames.slice(0, 20).join('\n') : 'Nobody online';
+  const maintenance = await getMaintenanceSnapshot(env);
+
+  const restartValue = maintenance.nextRestartAtMs !== undefined
+    ? `<t:${Math.floor(maintenance.nextRestartAtMs / 1000)}:R>`
+    : 'Not configured';
+  const modsValue = maintenance.pendingMods > 0
+    ? `⚠️ ${maintenance.pendingMods} update${maintenance.pendingMods === 1 ? '' : 's'} pending${maintenance.pendingTitles.length ? `\n${maintenance.pendingTitles.map((title) => `• ${title}`).join('\n')}` : ''}`
+    : '✅ No known pending updates';
+
   const fields: Record<string, unknown>[] = [
     { name: 'Players', value: players, inline: true },
     { name: 'RCON', value: status.pingMs !== undefined ? `${status.pingMs} ms` : '—', inline: true },
     { name: 'Last checked', value: discordRelativeTime(status.checkedAt), inline: true },
+    { name: 'Next restart', value: restartValue, inline: true },
+    { name: 'Mods', value: modsValue.slice(0, 1024), inline: false },
     { name: 'Online', value: names, inline: false },
   ];
 
@@ -169,7 +180,7 @@ async function discordRequest(env: Env, path: string, init: RequestInit): Promis
 }
 
 async function syncStatusMessage(env: Env, status: ServerStatus): Promise<void> {
-  const payload = statusMessage(status);
+  const payload = await statusMessage(env, status);
   const existingId = await getSetting(env, 'status_message_id');
 
   if (existingId) {
@@ -192,6 +203,7 @@ async function syncStatusMessage(env: Env, status: ServerStatus): Promise<void> 
 
 async function notifyTransition(env: Env, before: ServerStatus | null, after: ServerStatus): Promise<void> {
   if (!before || before.health === after.health) return;
+  if (isPlannedMaintenanceWindow(env)) return;
 
   const users = await env.DB.prepare('SELECT discord_user_id FROM subscriptions').all<{ discord_user_id: string }>();
   if (!users.results.length) return;
@@ -583,6 +595,10 @@ export default {
   },
 
   async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
-    ctx.waitUntil(refreshViaRcon(env));
+    ctx.waitUntil((async () => {
+      const rawStatus = await probeRconStatus(env);
+      await runMaintenanceTick(env, rawStatus);
+      await applyStatus(env, rawStatus);
+    })());
   },
 };
