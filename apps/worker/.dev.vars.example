@@ -8,8 +8,10 @@ RCON_PORT=27020
 RCON_PASSWORD=replace-me
 JOIN_TEXT=Connect to the Project Zomboid server using the saved server entry in-game.
 
-# Planned maintenance. Set RESTART_ANCHOR_UTC to one real HostHavoc restart time.
-# Example only: 2026-09-22T00:00:00Z
+# Planned maintenance. Prefer local wall-clock scheduling so DST changes stay aligned
+# with the HostHavoc panel. RESTART_ANCHOR_UTC remains supported as a fallback.
+RESTART_TIMEZONE=Europe/Kyiv
+RESTART_START_LOCAL=18:00
 RESTART_ANCHOR_UTC=
 RESTART_INTERVAL_HOURS=6
 # Planned gap between HostHavoc STOP and START tasks.
