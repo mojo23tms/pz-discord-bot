@@ -111,7 +111,7 @@ function localParts(timestampMs: number, timeZone: string): LocalDateParts {
 }
 
 function parseLocalClock(raw: string | undefined): { hour: number; minute: number } | null {
-  const match = raw?.trim().match(/^(\\d{1,2}):(\\d{2})$/);
+  const match = raw?.trim().match(/^(\d{1,2}):(\d{2})$/);
   if (!match) return null;
 
   const hour = Number(match[1]);
