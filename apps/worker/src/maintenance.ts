@@ -9,7 +9,11 @@ export interface MaintenanceEnv {
   RCON_PORT: string;
   RCON_PASSWORD: string;
   RESTART_ANCHOR_UTC?: string;
+  RESTART_TIMEZONE?: string;
+  RESTART_START_LOCAL?: string;
   RESTART_INTERVAL_HOURS?: string;
+  RESTART_DOWNTIME_MINUTES?: string;
+  RESTART_RECOVERY_GRACE_MINUTES?: string;
   WORKSHOP_IDS?: string;
   WORKSHOP_POLL_MINUTES?: string;
 }
@@ -62,9 +66,9 @@ const STEAM_DETAILS_API = 'https://api.steampowered.com/ISteamRemoteStorage/GetP
 const MOD_POLL_SETTING_KEY = 'workshop_last_polled_at';
 const MOD_ALERT_SETTING_KEY = 'workshop_update_alert_message_id';
 const DEFAULT_RESTART_INTERVAL_HOURS = 6;
+const DEFAULT_RESTART_DOWNTIME_MINUTES = 10;
+const DEFAULT_RESTART_RECOVERY_GRACE_MINUTES = 5;
 const DEFAULT_WORKSHOP_POLL_MINUTES = 15;
-const RESTART_FAILURE_GRACE_MS = 5 * 60_000;
-const RESTART_OBSERVATION_WINDOW_MS = 10 * 60_000;
 
 function parsePositiveNumber(raw: string | undefined, fallback: number): number {
   const parsed = Number(raw);
@@ -77,7 +81,122 @@ function rconPort(env: MaintenanceEnv): number {
   return port;
 }
 
-function restartSchedule(env: MaintenanceEnv): { anchorMs: number; intervalMs: number } | null {
+interface LocalDateParts {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+}
+
+function localParts(timestampMs: number, timeZone: string): LocalDateParts {
+  const formatter = new Intl.DateTimeFormat('en-CA', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  });
+  const values = new Map(formatter.formatToParts(new Date(timestampMs)).map((part) => [part.type, part.value]));
+
+  return {
+    year: Number(values.get('year')),
+    month: Number(values.get('month')),
+    day: Number(values.get('day')),
+    hour: Number(values.get('hour')),
+    minute: Number(values.get('minute')),
+  };
+}
+
+function parseLocalClock(raw: string | undefined): { hour: number; minute: number } | null {
+  const match = raw?.trim().match(/^(\\d{1,2}):(\\d{2})$/);
+  if (!match) return null;
+
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  if (!Number.isInteger(hour) || !Number.isInteger(minute) || hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+    return null;
+  }
+  return { hour, minute };
+}
+
+function zonedLocalToUtcMs(parts: LocalDateParts, timeZone: string): number {
+  const desiredPseudoUtc = Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, 0, 0);
+  let guess = desiredPseudoUtc;
+
+  // Resolve the time-zone offset iteratively. The scheduled hours are deliberately
+  // away from DST transition gaps, but this also keeps the calculation generic.
+  for (let i = 0; i < 4; i += 1) {
+    const actual = localParts(guess, timeZone);
+    const actualPseudoUtc = Date.UTC(
+      actual.year,
+      actual.month - 1,
+      actual.day,
+      actual.hour,
+      actual.minute,
+      0,
+      0,
+    );
+    const delta = desiredPseudoUtc - actualPseudoUtc;
+    if (delta === 0) return guess;
+    guess += delta;
+  }
+
+  return guess;
+}
+
+function addLocalDays(parts: LocalDateParts, days: number): LocalDateParts {
+  const date = new Date(Date.UTC(parts.year, parts.month - 1, parts.day + days, 12, 0, 0, 0));
+  return {
+    year: date.getUTCFullYear(),
+    month: date.getUTCMonth() + 1,
+    day: date.getUTCDate(),
+    hour: parts.hour,
+    minute: parts.minute,
+  };
+}
+
+function localScheduleCandidates(env: MaintenanceEnv, now: number): number[] | null {
+  const timeZone = env.RESTART_TIMEZONE?.trim();
+  const start = parseLocalClock(env.RESTART_START_LOCAL);
+  if (!timeZone || !start) return null;
+
+  // Validate the IANA zone early.
+  try {
+    localParts(now, timeZone);
+  } catch {
+    return null;
+  }
+
+  const intervalHours = parsePositiveNumber(env.RESTART_INTERVAL_HOURS, DEFAULT_RESTART_INTERVAL_HOURS);
+  const intervalMinutes = intervalHours * 60;
+  if (!Number.isInteger(intervalMinutes) || intervalMinutes <= 0 || intervalMinutes > 24 * 60) return null;
+
+  const targetMinutes = new Set<number>();
+  const startMinutes = start.hour * 60 + start.minute;
+  for (let offset = 0; offset < 24 * 60; offset += intervalMinutes) {
+    targetMinutes.add((startMinutes + offset) % (24 * 60));
+    if (targetMinutes.size > 24 * 60) break;
+  }
+
+  const localNow = localParts(now, timeZone);
+  const candidates: number[] = [];
+
+  for (const dayOffset of [-1, 0, 1, 2]) {
+    const date = addLocalDays(localNow, dayOffset);
+    for (const minuteOfDay of targetMinutes) {
+      const hour = Math.floor(minuteOfDay / 60);
+      const minute = minuteOfDay % 60;
+      candidates.push(zonedLocalToUtcMs({ ...date, hour, minute }, timeZone));
+    }
+  }
+
+  return [...new Set(candidates)].sort((a, b) => a - b);
+}
+
+function utcAnchorSchedule(env: MaintenanceEnv): { anchorMs: number; intervalMs: number } | null {
   if (!env.RESTART_ANCHOR_UTC?.trim()) return null;
   const anchorMs = Date.parse(env.RESTART_ANCHOR_UTC);
   if (!Number.isFinite(anchorMs)) return null;
@@ -87,7 +206,12 @@ function restartSchedule(env: MaintenanceEnv): { anchorMs: number; intervalMs: n
 }
 
 export function nextRestartAtMs(env: MaintenanceEnv, now = Date.now()): number | undefined {
-  const schedule = restartSchedule(env);
+  const localCandidates = localScheduleCandidates(env, now);
+  if (localCandidates) return localCandidates.find((candidate) => candidate >= now);
+
+  // Backwards-compatible fixed-UTC mode. Prefer RESTART_TIMEZONE +
+  // RESTART_START_LOCAL for schedules that follow local wall time across DST.
+  const schedule = utcAnchorSchedule(env);
   if (!schedule) return undefined;
   if (now <= schedule.anchorMs) return schedule.anchorMs;
 
@@ -96,11 +220,28 @@ export function nextRestartAtMs(env: MaintenanceEnv, now = Date.now()): number |
 }
 
 function previousRestartAtMs(env: MaintenanceEnv, now = Date.now()): number | undefined {
-  const schedule = restartSchedule(env);
+  const localCandidates = localScheduleCandidates(env, now);
+  if (localCandidates) {
+    for (let i = localCandidates.length - 1; i >= 0; i -= 1) {
+      const candidate = localCandidates[i];
+      if (candidate !== undefined && candidate <= now) return candidate;
+    }
+    return undefined;
+  }
+
+  const schedule = utcAnchorSchedule(env);
   if (!schedule || now < schedule.anchorMs) return undefined;
 
   const intervalsElapsed = Math.floor((now - schedule.anchorMs) / schedule.intervalMs);
   return schedule.anchorMs + intervalsElapsed * schedule.intervalMs;
+}
+
+function restartDowntimeMs(env: MaintenanceEnv): number {
+  return parsePositiveNumber(env.RESTART_DOWNTIME_MINUTES, DEFAULT_RESTART_DOWNTIME_MINUTES) * 60_000;
+}
+
+function restartRecoveryGraceMs(env: MaintenanceEnv): number {
+  return parsePositiveNumber(env.RESTART_RECOVERY_GRACE_MINUTES, DEFAULT_RESTART_RECOVERY_GRACE_MINUTES) * 60_000;
 }
 
 export function isPlannedMaintenanceWindow(env: MaintenanceEnv, now = Date.now()): boolean {
@@ -108,7 +249,10 @@ export function isPlannedMaintenanceWindow(env: MaintenanceEnv, now = Date.now()
   if (next !== undefined && next - now >= 0 && next - now <= 2 * 60_000) return true;
 
   const previous = previousRestartAtMs(env, now);
-  return previous !== undefined && now - previous >= 0 && now - previous <= RESTART_FAILURE_GRACE_MS;
+  if (previous === undefined) return false;
+
+  const expectedStartAt = previous + restartDowntimeMs(env);
+  return now - previous >= 0 && now <= expectedStartAt + restartRecoveryGraceMs(env);
 }
 
 async function getSetting(env: MaintenanceEnv, key: string): Promise<string | null> {
@@ -196,12 +340,12 @@ function warningText(milestoneMinutes: number, remainingMs: number): string {
   const closeToMilestone = Math.abs(actualMinutes - milestoneMinutes) <= 2;
   const minutes = closeToMilestone ? milestoneMinutes : actualMinutes;
 
-  if (minutes === 60) return 'SERVER: Planned restart in 1 hour.';
-  if (minutes === 1) return 'SERVER: Planned restart in 1 minute. Saving world now.';
+  if (minutes === 60) return 'SERVER: Planned maintenance in 1 hour.';
+  if (minutes === 1) return 'SERVER: Planned maintenance in 1 minute. Saving world now.';
   if (minutes <= 5) {
-    return `SERVER: Planned restart in about ${minutes} minute${minutes === 1 ? '' : 's'}. Find a safe place and finish what you are doing.`;
+    return `SERVER: Planned maintenance in about ${minutes} minute${minutes === 1 ? '' : 's'}. Find a safe place and finish what you are doing.`;
   }
-  return `SERVER: Planned restart in about ${minutes} minutes.`;
+  return `SERVER: Planned maintenance in about ${minutes} minutes.`;
 }
 
 async function markCycleColumn(
@@ -448,7 +592,12 @@ async function processRestartObservation(
   now: number,
   restartAt: number,
 ): Promise<void> {
-  if (now < restartAt || now - restartAt > RESTART_OBSERVATION_WINDOW_MS) return;
+  const downtimeMs = restartDowntimeMs(env);
+  const recoveryGraceMs = restartRecoveryGraceMs(env);
+  const expectedStartAt = restartAt + downtimeMs;
+  const observationEnd = expectedStartAt + recoveryGraceMs + 5 * 60_000;
+
+  if (now < restartAt || now > observationEnd) return;
 
   await ensureRestartCycle(env, restartAt);
   const cycle = await getRestartCycle(env, restartAt);
@@ -459,10 +608,11 @@ async function processRestartObservation(
       await markCycleColumn(env, restartAt, 'outage_seen_at', now);
     }
 
-    if (now - restartAt >= RESTART_FAILURE_GRACE_MS && cycle.failure_alert_at === null) {
+    if (now >= expectedStartAt + recoveryGraceMs && cycle.failure_alert_at === null) {
+      const graceMinutes = Math.round(recoveryGraceMs / 60_000);
       const messageId = await postDiscordMessage(
         env,
-        `🔴 **Planned restart has not recovered normally.**\nThe server is still unreachable more than 5 minutes after the scheduled restart (<t:${Math.floor(restartAt / 1000)}:t>). HostHavoc may need manual attention.`,
+        `🔴 **Planned maintenance has not recovered normally.**\nThe server is still unreachable more than ${graceMinutes} minutes after its scheduled start (<t:${Math.floor(expectedStartAt / 1000)}:t>). HostHavoc may need manual attention.`,
       );
 
       await env.DB.prepare(
@@ -475,7 +625,7 @@ async function processRestartObservation(
     return;
   }
 
-  if (cycle.outage_seen_at !== null && cycle.recovered_at === null) {
+  if (cycle.outage_seen_at !== null && cycle.recovered_at === null && now >= restartAt) {
     await markCycleColumn(env, restartAt, 'recovered_at', now);
     await clearHandledWorkshopUpdates(env, restartAt);
 
