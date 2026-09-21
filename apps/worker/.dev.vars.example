@@ -12,6 +12,10 @@ JOIN_TEXT=Connect to the Project Zomboid server using the saved server entry in-
 # Example only: 2026-09-22T00:00:00Z
 RESTART_ANCHOR_UTC=
 RESTART_INTERVAL_HOURS=6
+# Planned gap between HostHavoc STOP and START tasks.
+RESTART_DOWNTIME_MINUTES=10
+# Alert only if the server is still down this long after the START task.
+RESTART_RECOVERY_GRACE_MINUTES=5
 
 # Semicolon/comma/space-separated Project Zomboid Workshop IDs.
 WORKSHOP_IDS=
