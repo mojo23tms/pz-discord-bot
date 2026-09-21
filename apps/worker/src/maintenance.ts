@@ -9,6 +9,8 @@ export interface MaintenanceEnv {
   RCON_PORT: string;
   RCON_PASSWORD: string;
   RESTART_ANCHOR_UTC?: string;
+  RESTART_TIMEZONE?: string;
+  RESTART_START_LOCAL?: string;
   RESTART_INTERVAL_HOURS?: string;
   RESTART_DOWNTIME_MINUTES?: string;
   RESTART_RECOVERY_GRACE_MINUTES?: string;
@@ -79,7 +81,122 @@ function rconPort(env: MaintenanceEnv): number {
   return port;
 }
 
-function restartSchedule(env: MaintenanceEnv): { anchorMs: number; intervalMs: number } | null {
+interface LocalDateParts {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+}
+
+function localParts(timestampMs: number, timeZone: string): LocalDateParts {
+  const formatter = new Intl.DateTimeFormat('en-CA', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  });
+  const values = new Map(formatter.formatToParts(new Date(timestampMs)).map((part) => [part.type, part.value]));
+
+  return {
+    year: Number(values.get('year')),
+    month: Number(values.get('month')),
+    day: Number(values.get('day')),
+    hour: Number(values.get('hour')),
+    minute: Number(values.get('minute')),
+  };
+}
+
+function parseLocalClock(raw: string | undefined): { hour: number; minute: number } | null {
+  const match = raw?.trim().match(/^(\\d{1,2}):(\\d{2})$/);
+  if (!match) return null;
+
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  if (!Number.isInteger(hour) || !Number.isInteger(minute) || hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+    return null;
+  }
+  return { hour, minute };
+}
+
+function zonedLocalToUtcMs(parts: LocalDateParts, timeZone: string): number {
+  const desiredPseudoUtc = Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, 0, 0);
+  let guess = desiredPseudoUtc;
+
+  // Resolve the time-zone offset iteratively. The scheduled hours are deliberately
+  // away from DST transition gaps, but this also keeps the calculation generic.
+  for (let i = 0; i < 4; i += 1) {
+    const actual = localParts(guess, timeZone);
+    const actualPseudoUtc = Date.UTC(
+      actual.year,
+      actual.month - 1,
+      actual.day,
+      actual.hour,
+      actual.minute,
+      0,
+      0,
+    );
+    const delta = desiredPseudoUtc - actualPseudoUtc;
+    if (delta === 0) return guess;
+    guess += delta;
+  }
+
+  return guess;
+}
+
+function addLocalDays(parts: LocalDateParts, days: number): LocalDateParts {
+  const date = new Date(Date.UTC(parts.year, parts.month - 1, parts.day + days, 12, 0, 0, 0));
+  return {
+    year: date.getUTCFullYear(),
+    month: date.getUTCMonth() + 1,
+    day: date.getUTCDate(),
+    hour: parts.hour,
+    minute: parts.minute,
+  };
+}
+
+function localScheduleCandidates(env: MaintenanceEnv, now: number): number[] | null {
+  const timeZone = env.RESTART_TIMEZONE?.trim();
+  const start = parseLocalClock(env.RESTART_START_LOCAL);
+  if (!timeZone || !start) return null;
+
+  // Validate the IANA zone early.
+  try {
+    localParts(now, timeZone);
+  } catch {
+    return null;
+  }
+
+  const intervalHours = parsePositiveNumber(env.RESTART_INTERVAL_HOURS, DEFAULT_RESTART_INTERVAL_HOURS);
+  const intervalMinutes = intervalHours * 60;
+  if (!Number.isInteger(intervalMinutes) || intervalMinutes <= 0 || intervalMinutes > 24 * 60) return null;
+
+  const targetMinutes = new Set<number>();
+  const startMinutes = start.hour * 60 + start.minute;
+  for (let offset = 0; offset < 24 * 60; offset += intervalMinutes) {
+    targetMinutes.add((startMinutes + offset) % (24 * 60));
+    if (targetMinutes.size > 24 * 60) break;
+  }
+
+  const localNow = localParts(now, timeZone);
+  const candidates: number[] = [];
+
+  for (const dayOffset of [-1, 0, 1, 2]) {
+    const date = addLocalDays(localNow, dayOffset);
+    for (const minuteOfDay of targetMinutes) {
+      const hour = Math.floor(minuteOfDay / 60);
+      const minute = minuteOfDay % 60;
+      candidates.push(zonedLocalToUtcMs({ ...date, hour, minute }, timeZone));
+    }
+  }
+
+  return [...new Set(candidates)].sort((a, b) => a - b);
+}
+
+function utcAnchorSchedule(env: MaintenanceEnv): { anchorMs: number; intervalMs: number } | null {
   if (!env.RESTART_ANCHOR_UTC?.trim()) return null;
   const anchorMs = Date.parse(env.RESTART_ANCHOR_UTC);
   if (!Number.isFinite(anchorMs)) return null;
@@ -89,7 +206,12 @@ function restartSchedule(env: MaintenanceEnv): { anchorMs: number; intervalMs: n
 }
 
 export function nextRestartAtMs(env: MaintenanceEnv, now = Date.now()): number | undefined {
-  const schedule = restartSchedule(env);
+  const localCandidates = localScheduleCandidates(env, now);
+  if (localCandidates) return localCandidates.find((candidate) => candidate >= now);
+
+  // Backwards-compatible fixed-UTC mode. Prefer RESTART_TIMEZONE +
+  // RESTART_START_LOCAL for schedules that follow local wall time across DST.
+  const schedule = utcAnchorSchedule(env);
   if (!schedule) return undefined;
   if (now <= schedule.anchorMs) return schedule.anchorMs;
 
@@ -98,7 +220,16 @@ export function nextRestartAtMs(env: MaintenanceEnv, now = Date.now()): number |
 }
 
 function previousRestartAtMs(env: MaintenanceEnv, now = Date.now()): number | undefined {
-  const schedule = restartSchedule(env);
+  const localCandidates = localScheduleCandidates(env, now);
+  if (localCandidates) {
+    for (let i = localCandidates.length - 1; i >= 0; i -= 1) {
+      const candidate = localCandidates[i];
+      if (candidate !== undefined && candidate <= now) return candidate;
+    }
+    return undefined;
+  }
+
+  const schedule = utcAnchorSchedule(env);
   if (!schedule || now < schedule.anchorMs) return undefined;
 
   const intervalsElapsed = Math.floor((now - schedule.anchorMs) / schedule.intervalMs);
